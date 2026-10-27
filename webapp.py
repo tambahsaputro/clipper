@@ -266,6 +266,8 @@ def preview():
         Path(src).unlink(missing_ok=True)
         if params.get("watermark"):
             Path(params["watermark"]).unlink(missing_ok=True)
+        for _t in PREVIEWS.glob("prev_txt_*.txt"):
+            _t.unlink(missing_ok=True)
 
 
 @app.get("/previews/<name>")
