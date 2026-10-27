@@ -9,9 +9,11 @@ import clipper, editor
 BASE = Path(__file__).parent.resolve()
 RUNS = Path(os.environ.get("CLIPPER_DATA", BASE / "runs")).expanduser()
 UPLOADS = RUNS / "_uploads"
+PREVIEWS = RUNS / "_previews"
 SETTINGS = BASE / "settings.json"
 RUNS.mkdir(parents=True, exist_ok=True)
 UPLOADS.mkdir(parents=True, exist_ok=True)
+PREVIEWS.mkdir(parents=True, exist_ok=True)
 
 JID = re.compile(r"^[0-9a-f]{10}$")
 CLIP = re.compile(r"^clip(\d+)\.mp4$")
@@ -213,6 +215,64 @@ def edit():
 def status(jid):
     if jid not in JOBS: abort(404)
     return jsonify(JOBS[jid])
+
+
+@app.post("/preview")
+def preview():
+    f = request.files.get("file")
+    url = request.form.get("url", "").strip()
+    if f and f.filename:
+        path = UPLOADS / f"prev_{uuid.uuid4().hex[:8]}_{secure_filename(f.filename)}"
+        f.save(path)
+        src = str(path)
+    elif url:
+        return jsonify(error="Preview hanya untuk file lokal (URL akan diunduh penuh)."), 400
+    else:
+        return jsonify(error="Pilih file video dulu."), 400
+    try:
+        overlays = json.loads(request.form.get("text_overlays", "[]"))
+    except Exception:
+        overlays = []
+    try:
+        wm_size = int(request.form.get("watermark_size", 200))
+    except ValueError:
+        wm_size = 200
+    try:
+        ptime = float(request.form.get("preview_time", 1))
+    except ValueError:
+        ptime = 1.0
+    params = {
+        "aspect": request.form.get("aspect", "9:16"),
+        "text_overlays": overlays,
+        "color_grade": request.form.get("color_grade", "none"),
+        "vignette": request.form.get("vignette") == "on",
+        "sharpen": request.form.get("sharpen") == "on",
+        "watermark_position": request.form.get("watermark_position", "top-right"),
+        "watermark_size": wm_size,
+    }
+    wm_f = request.files.get("watermark")
+    if wm_f and wm_f.filename:
+        wm_path = UPLOADS / f"wmp_{uuid.uuid4().hex[:8]}_{secure_filename(wm_f.filename)}"
+        wm_f.save(wm_path)
+        params["watermark"] = str(wm_path)
+    pname = f"prev_{uuid.uuid4().hex[:10]}.png"
+    try:
+        editor.preview_frame(src, params, PREVIEWS, time=ptime, name=pname)
+        return jsonify(url=f"/previews/{pname}", time=ptime)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify(error=f"Preview gagal: {e}"), 500
+    finally:
+        Path(src).unlink(missing_ok=True)
+        if params.get("watermark"):
+            Path(params["watermark"]).unlink(missing_ok=True)
+
+
+@app.get("/previews/<name>")
+def previews(name):
+    if not re.match(r"^prev_[a-f0-9]+\.png$", name):
+        abort(404)
+    return send_from_directory(PREVIEWS, name)
 
 
 @app.get("/api/storage")
@@ -420,8 +480,16 @@ button:disabled{opacity:.5;cursor:wait}
 <label style="margin-top:16px">Text overlay (opsional)</label>
 <div id="overlayList"></div>
 <button type="button" class="sec" id="addOverlay" style="margin-top:8px">+ Tambah teks</button>
-<div style="margin-top:16px"><button id="goEdit">Mulai edit</button></div>
+<div style="margin-top:16px">
+<button type="button" class="sec" id="btnPreview">Preview frame</button>
+<button id="goEdit">Mulai edit</button>
+</div>
 </form></div>
+<div class="card" id="previewBox" hidden>
+<div style="font-weight:600;margin-bottom:8px">Preview (frame pada detik ke-1)</div>
+<img id="previewImg" style="max-width:100%;border-radius:8px;display:block">
+<div class="mu" style="margin-top:6px">Subtitle & BGM tidak ditampilkan di preview. Ini hanya perkiraan visual.</div>
+</div>
 <div class="card" id="progEdit" hidden><div id="stepEdit"></div></div>
 <div class="clips" id="outEdit"></div>
 </section>
@@ -585,6 +653,31 @@ async function pollEdit(id){
     loadStor();
   }
 }
+$('#btnPreview').onclick=async()=>{
+  const fd=new FormData(fE);
+  const overlays=[...document.querySelectorAll('#overlayList > div')].map(d=>({
+    text:d.querySelector('.ov-text').value,
+    start:parseFloat(d.querySelector('.ov-start').value)||0,
+    end:parseFloat(d.querySelector('.ov-end').value)||3,
+    position:d.querySelector('.ov-pos').value,
+    size:parseInt(d.querySelector('.ov-size').value)||60,
+    color:d.querySelector('.ov-color').value,
+  })).filter(o=>o.text.trim());
+  fd.append('text_overlays',JSON.stringify(overlays));
+  fd.append('preview_time','1');
+  $('#btnPreview').disabled=true;
+  say('Membuat preview...');
+  try{
+    const r=await fetch('/preview',{method:'POST',body:fd});
+    const d=await r.json();
+    if(!r.ok){say(d.error||'Preview gagal',1);return}
+    $('#previewImg').src=d.url+'?t='+Date.now();
+    $('#previewBox').hidden=false;
+    say('Preview siap. Kalau sudah pas, klik "Mulai edit".');
+  }catch(e){say('Preview error: '+e,1)}
+  finally{$('#btnPreview').disabled=false}
+};
+
 loadStor();
 </script></main></body></html>
 """
