@@ -589,6 +589,22 @@ loadStor();
 </script></main></body></html>
 """
 
+def _local_ip():
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
 if __name__ == "__main__":
-    print("Buka di browser: http://127.0.0.1:5000")
-    app.run(host="127.0.0.1", port=5000)
+    ip = _local_ip()
+    print("=" * 50)
+    print(f"Buka di browser (laptop): http://127.0.0.1:5000")
+    print(f"Buka dari HP/device lain: http://{ip}:5000")
+    print("=" * 50)
+    app.run(host="0.0.0.0", port=5000)
