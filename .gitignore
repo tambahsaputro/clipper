@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+runs/
+test_out/
+output*/
+video/
+source.mp4
+run.log
+*.bak
+settings.json
