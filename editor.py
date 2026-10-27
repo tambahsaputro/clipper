@@ -143,10 +143,33 @@ def edit_video(src, params, out_dir, on_progress=None):
     aw, ah = {"9:16": (1080, 1920), "1:1": (1080, 1080),
               "16:9": (1920, 1080)}.get(aspect, (1080, 1920))
 
-    filters = [
-        f"scale={aw}:{ah}:force_original_aspect_ratio=increase",
-        f"crop={aw}:{ah}",
-    ]
+    kb = params.get("ken_burns", "none")
+    if kb != "none":
+        w2, h2 = aw * 2, ah * 2
+        filters = [
+            f"scale={w2}:{h2}:force_original_aspect_ratio=increase",
+            f"crop={w2}:{h2}",
+        ]
+        if kb == "zoom-in":
+            zexpr = "min(1+on/500,1.5)"
+        elif kb == "zoom-out":
+            zexpr = "max(1.5-on/500,1.0)"
+        else:  # pan-right
+            zexpr = "1.3"
+        if kb == "pan-right":
+            xexpr = "iw/2-(iw/zoom/2)+t*50"
+            yexpr = "ih/2-(ih/zoom/2)"
+        else:
+            xexpr = "iw/2-(iw/zoom/2)"
+            yexpr = "ih/2-(ih/zoom/2)"
+        filters.append(
+            f"zoompan=z='{zexpr}':x='{xexpr}':y='{yexpr}':d=1:s={aw}x{ah}:fps=30"
+        )
+    else:
+        filters = [
+            f"scale={aw}:{ah}:force_original_aspect_ratio=increase",
+            f"crop={aw}:{ah}",
+        ]
 
     cg = params.get("color_grade", "none")
     if cg == "warm":
