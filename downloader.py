@@ -158,7 +158,11 @@ setInterval(refresh,1000);
 </script></body></html>"""
 
 
-def _hook(jid: str):
+def _hook(jid: str, total_expected: list):
+    """Progress hook: agregasi byte dari semua stream (video+audio).
+    `total_expected[0]` = total byte semua stream (diisi saat extract_info).
+    Progress hanya naik (monotonic) — tidak mundur saat ganti stream."""
+    state = {"last_bytes": 0, "prev_stream_bytes": 0, "prev_total": 0}
     def hook(d):
         cur = JOBS.get(jid)
         if cur is None: return
@@ -166,16 +170,36 @@ def _hook(jid: str):
             raise RuntimeError("dibatalkan user")
         st = d.get("status")
         if st == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            dl    = d.get("downloaded_bytes", 0)
+            dl    = d.get("downloaded_bytes", 0) or 0
+            # deteksi ganti stream: total stream berubah → simpan byte stream sebelumnya
+            stream_total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            if stream_total and state["prev_total"] and stream_total != state["prev_total"]:
+                state["prev_stream_bytes"] += state["last_bytes"]
+                state["last_bytes"] = 0
+            if stream_total:
+                state["prev_total"] = stream_total
+            state["last_bytes"] = dl
+            cumulative = state["prev_stream_bytes"] + dl
+            overall = total_expected[0]
+            if overall:
+                pct = min(99.9, cumulative / overall * 100.0)
+            else:
+                # fallback: pakai total stream saat ini
+                pct = (dl / stream_total * 100.0) if stream_total else 0.0
+            # monotonic: jangan pernah turun
+            pct = max(pct, cur.get("percent") or 0.0)
             cur.update(
                 status="downloading",
-                percent=(dl / total * 100.0) if total else 0.0,
-                downloaded=dl, total=total,
+                percent=pct,
+                downloaded=cumulative,
+                total=overall or stream_total,
                 speed=d.get("speed") or 0, eta=d.get("eta") or 0,
             )
         elif st == "finished":
-            cur.update(status="processing", percent=100.0)
+            # stream selesai — simpan byte & reset untuk stream berikutnya
+            state["prev_stream_bytes"] += state["last_bytes"]
+            state["last_bytes"] = 0
+            cur.update(status="processing", percent=max(cur.get("percent") or 0.0, 99.9))
     return hook
 
 
@@ -190,9 +214,10 @@ def _worker(jid: str, url: str, opts: dict) -> None:
             return
         out = LIBRARY / jid
         out.mkdir(parents=True, exist_ok=True)
+        total_expected = [0]
         ydl_opts = {
             "outtmpl": str(out / "%(title).80s.%(ext)s"),
-            "progress_hooks": [_hook(jid)],
+            "progress_hooks": [_hook(jid, total_expected)],
             "format": opts.get("format") or "bestvideo[height<=720]+bestaudio/best[height<=720]",
             "merge_output_format": "mp4",
             "quiet": True, "no_warnings": True, "noplaylist": True,
@@ -205,11 +230,21 @@ def _worker(jid: str, url: str, opts: dict) -> None:
                 info = ydl.extract_info(url, download=False)
                 if cur.get("cancel"):
                     raise RuntimeError("dibatalkan user")
+                # hitung total byte semua stream (video + audio)
+                fmts = info.get("requested_formats") or []
+                total_bytes = sum(
+                    (f.get("filesize") or f.get("filesize_approx") or 0)
+                    for f in fmts
+                )
+                if not total_bytes:
+                    total_bytes = info.get("filesize") or info.get("filesize_approx") or 0
+                total_expected[0] = total_bytes
                 cur.update(
                     title=info.get("title") or "video",
                     thumbnail=info.get("thumbnail"),
                     duration=info.get("duration"),
                     uploader=info.get("uploader"),
+                    total=total_bytes,
                     status="downloading",
                 )
                 _log(jid, f"download start: {info.get('title')}")
@@ -232,6 +267,7 @@ def _worker(jid: str, url: str, opts: dict) -> None:
                 "status": "done",
             }
             (out / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+            meta["percent"] = 100.0
             cur.update(meta)
             _log(jid, f"done: {final.name} ({final.stat().st_size} bytes)")
         except Exception as e:
@@ -292,8 +328,9 @@ def listing():
             m = d / "meta.json"
             if m.exists():
                 try:
-                    items.append({**json.loads(m.read_text()),
-                                  "jid": d.name, "status": "done"})
+                    rec = json.loads(m.read_text())
+                    rec.setdefault("percent", 100.0)
+                    items.append({**rec, "jid": d.name, "status": "done"})
                 except Exception:
                     pass
     items.sort(key=lambda x: x.get("downloaded_at") or x.get("created") or 0,
