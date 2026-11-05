@@ -1,35 +1,31 @@
 """downloader.py — Blueprint Flask: koleksi video dari URL via yt-dlp.
 
-Routes:
-  GET  /download                    UI standalone
-  POST /api/download                mulai job {url, format}
-  GET  /api/download/<jid>          status satu job
-  GET  /api/downloads               list semua (aktif + disk)
-  POST /api/download/delete         hapus job + file
-  POST /api/download/cancel         batalkan job berjalan
-  GET  /library/<jid>/<name>        serve video
+Fase status: queued → extracting → downloading → processing → done | error
 """
 from __future__ import annotations
-import json, os, re, shutil, threading, time, uuid
+import json, os, re, shutil, sys, threading, time, traceback, uuid
 from pathlib import Path
 from flask import (Blueprint, abort, jsonify, render_template_string,
                    request, send_from_directory)
 
-bp = Blueprint("downloader", __name__)
-BASE    = Path(__file__).parent.resolve()
-LIBRARY = Path(os.environ.get("CLIPPER_LIBRARY", BASE / "library")).expanduser()
+bp       = Blueprint("downloader", __name__)
+BASE     = Path(__file__).parent.resolve()
+LIBRARY  = Path(os.environ.get("CLIPPER_LIBRARY", BASE / "library")).expanduser()
 LIBRARY.mkdir(parents=True, exist_ok=True)
 
-JID          = re.compile(r"^[0-9a-f]{10}$")
+JID   = re.compile(r"^[0-9a-f]{10}$")
 JOBS: dict[str, dict] = {}
-_SEM = threading.Semaphore(int(os.environ.get("CLIPPER_DL_PARALLEL", "3")))
+_SEM  = threading.Semaphore(int(os.environ.get("CLIPPER_DL_PARALLEL", "3")))
+
+def _log(jid: str, *args) -> None:
+    print(f"[dl:{jid}]", *args, file=sys.stderr, flush=True)
 
 _UI = r"""<!doctype html>
 <html lang="id"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Downloader · Clipper</title>
 <style>
-:root{--bg:#0f1115;--card:#181c24;--bd:#2a3140;--fg:#e6edf3;--mut:#8b96a8;--acc:#4f9cf9;--ok:#3fb950;--err:#f85149}
+:root{--bg:#0f1115;--card:#181c24;--bd:#2a3140;--fg:#e6edf3;--mut:#8b96a8;--acc:#4f9cf9;--ok:#3fb950;--err:#f85149;--warn:#d29922}
 *{box-sizing:border-box}body{margin:0;font:14px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
 header{display:flex;align-items:center;gap:16px;padding:14px 20px;border-bottom:1px solid var(--bd);background:var(--card)}
 header h1{margin:0;font-size:16px;font-weight:600}
@@ -43,15 +39,21 @@ select,button{padding:8px 14px;border-radius:8px;border:1px solid var(--bd);back
 button.primary{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
 button.primary:disabled{opacity:.5;cursor:wait}
 button.danger{background:transparent;border-color:var(--err);color:var(--err);padding:4px 10px;font-size:12px}
+button.warn{background:transparent;border-color:var(--warn);color:var(--warn);padding:4px 10px;font-size:12px}
 .job{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px;margin-bottom:12px;display:flex;gap:14px}
 .job img{width:120px;height:68px;object-fit:cover;border-radius:6px;background:#0a0d12;flex-shrink:0}
 .job .info{flex:1;min-width:0}.job .title{font-weight:600;margin:0 0 4px;word-break:break-word}
 .job .meta{color:var(--mut);font-size:12px}
-.bar{height:6px;background:#0a0d12;border-radius:3px;overflow:hidden;margin-top:8px}
-.bar div{height:100%;background:var(--acc);transition:width .3s}
-.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
-.b-queued{background:#2a3140;color:var(--mut)}.b-downloading{background:#1a3a5c;color:var(--acc)}
-.b-processing{background:#3d2e00;color:#d29922}.b-done{background:#12341e;color:var(--ok)}
+.bar{height:8px;background:#0a0d12;border-radius:4px;overflow:hidden;margin-top:8px;position:relative}
+.bar>div{height:100%;background:var(--acc);transition:width .25s ease;border-radius:4px}
+.bar.indet>div{width:35%;animation:slide 1.3s ease-in-out infinite;border-radius:4px}
+@keyframes slide{0%{transform:translateX(-100%)}100%{transform:translateX(320%)}}
+.bar.done>div{background:var(--ok)}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;white-space:nowrap}
+.b-queued,.b-extracting{background:#3d2e00;color:var(--warn)}
+.b-downloading{background:#1a3a5c;color:var(--acc)}
+.b-processing{background:#3d2e00;color:var(--warn)}
+.b-done{background:#12341e;color:var(--ok)}
 .b-error{background:#3d1418;color:var(--err)}
 .empty{text-align:center;color:var(--mut);padding:40px}
 video{max-width:100%;border-radius:6px;margin-top:8px}
@@ -77,9 +79,12 @@ video{max-width:100%;border-radius:6px;margin-top:8px}
 </div>
 <script>
 const $=id=>document.getElementById(id);
-const fs=b=>!b?'':b>1e9?(b/1e9).toFixed(2)+' GB':b>1e6?(b/1e6).toFixed(1)+' MB':((b/1e3)|0)+' KB';
-const fd=s=>!s?'':Math.floor(s/60)+':'+String(s%60|0).padStart(2,'0');
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fs=b=>!b||b<1?'':b>1e9?(b/1e9).toFixed(2)+' GB':b>1e6?(b/1e6).toFixed(1)+' MB':((b/1e3)|0)+' KB';
+const fd=s=>!s||s<0?'':Math.floor(s/60)+':'+String(s%60|0).padStart(2,'0');
 const badge=s=>`<span class="badge b-${s}">${s}</span>`;
+const ACTIVE=['queued','extracting','downloading','processing'];
+
 $('go').onclick=async()=>{
   const urls=$('urls').value.split('\n').map(s=>s.trim()).filter(Boolean);
   if(!urls.length)return;
@@ -92,26 +97,42 @@ $('go').onclick=async()=>{
   $('urls').value='';$('msg').textContent=`✅ ${ok} antri${fail?` · ❌ ${fail} gagal`:''}`;
   $('go').disabled=false;refresh();
 };
+
 async function refresh(){
-  try{const r=await fetch('/api/downloads');const {items}=await r.json();
+  try{
+    const r=await fetch('/api/downloads');
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const {items}=await r.json();
     $('list').innerHTML=items.length?items.map(render).join(''):'<div class="empty">Belum ada download.</div>';
-  }catch(e){}
+  }catch(e){
+    $('list').innerHTML=`<div class="empty" style="color:var(--err)">Gagal muat: ${esc(e.message)}<br><small>Cek console/log server.</small></div>`;
+  }
 }
+
 function render(j){
-  const st=j.status||'queued',pct=j.percent||0;
-  const active=['queued','downloading','processing'].includes(st);
-  const meta=st==='done'?`${fs(j.size)} · ${fd(j.duration)}`:st==='error'?`<span style="color:var(--err)">${(j.error||'').slice(0,140)}</span>`:`${pct.toFixed(1)}% · ${fs(j.speed)}/s${j.eta?' · ETA '+fd(j.eta):''}`;
-  const thumb=j.thumbnail?`<img src="${j.thumbnail}" onerror="this.style.visibility='hidden'">`:`<img style="opacity:.15">`;
+  const st=j.status||'queued', pct=j.percent||0;
+  const active=ACTIVE.includes(st);
+  let meta;
+  if(st==='done') meta=`${fs(j.size)} · ${fd(j.duration)}`;
+  else if(st==='error') meta=`<span style="color:var(--err)">${esc((j.error||'').slice(0,160))}</span>`;
+  else if(st==='extracting'||st==='queued') meta='Mengambil metadata…';
+  else if(st==='processing') meta='Menggabungkan video+audio…';
+  else meta=`${pct.toFixed(1)}% · ${fs(j.downloaded)} / ${fs(j.total)} · ${fs(j.speed)}/s${j.eta?' · ETA '+fd(j.eta):''}`;
+  const thumb=j.thumbnail?`<img src="${esc(j.thumbnail)}" onerror="this.style.visibility='hidden'">`:`<img style="opacity:.12">`;
   const video=st==='done'?`<video controls preload="metadata" src="/library/${j.jid}/${encodeURIComponent(j.file)}"></video>`:'';
+  let bar='';
+  if(st==='downloading') bar=`<div class="bar"><div style="width:${pct}%"></div></div>`;
+  else if(st==='extracting'||st==='queued'||st==='processing') bar=`<div class="bar indet"><div></div></div>`;
+  else if(st==='done') bar=`<div class="bar done"><div style="width:100%"></div></div>`;
   return `<div class="job">${thumb}<div class="info">
-    <div style="display:flex;gap:10px;align-items:start"><p class="title" style="flex:1">${j.title||j.url||'(tanpa judul)'}</p>${badge(st)}</div>
+    <div style="display:flex;gap:10px;align-items:start"><p class="title" style="flex:1">${esc(j.title||j.url||'(tanpa judul)')}</p>${badge(st)}</div>
     <div class="meta">${meta}</div>
-    ${active?`<div class="bar"><div style="width:${pct}%"></div></div>`:''}
-    ${video}
+    ${bar}${video}
     <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
-      ${j.url?`<a href="${j.url}" target="_blank" rel="noopener" class="meta">🔗 sumber</a>`:''}
+      ${j.url?`<a href="${esc(j.url)}" target="_blank" rel="noopener" class="meta">🔗 sumber</a>`:''}
       ${j.file?`<a href="/library/${j.jid}/${encodeURIComponent(j.file)}" download class="meta">⬇ simpan</a>`:''}
-      <button class="danger" style="margin-left:auto" onclick="del('${j.jid}')">Hapus</button>
+      ${active?`<button class="warn" style="margin-left:auto" onclick="cancel('${j.jid}')">Batal</button>`:''}
+      <button class="danger" style="${active?'':'margin-left:auto'}" onclick="del('${j.jid}')">Hapus</button>
     </div>
   </div></div>`;
 }
@@ -120,23 +141,32 @@ async function del(jid){
   await fetch('/api/download/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jid})});
   refresh();
 }
-refresh();setInterval(refresh,2000);
+async function cancel(jid){
+  await fetch('/api/download/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jid})});
+  refresh();
+}
+refresh();
+setInterval(refresh,1000);
 </script></body></html>"""
 
 
 def _hook(jid: str):
     def hook(d):
         cur = JOBS.get(jid)
-        if cur is None:
-            raise RuntimeError("job dihapus")
+        if cur is None: return
         if cur.get("cancel"):
             raise RuntimeError("dibatalkan user")
-        if d.get("status") == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 1
-            cur.update(status="downloading",
-                       percent=(d.get("downloaded_bytes", 0) / total) * 100.0,
-                       speed=d.get("speed") or 0, eta=d.get("eta") or 0)
-        elif d.get("status") == "finished":
+        st = d.get("status")
+        if st == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            dl    = d.get("downloaded_bytes", 0)
+            cur.update(
+                status="downloading",
+                percent=(dl / total * 100.0) if total else 0.0,
+                downloaded=dl, total=total,
+                speed=d.get("speed") or 0, eta=d.get("eta") or 0,
+            )
+        elif st == "finished":
             cur.update(status="processing", percent=100.0)
     return hook
 
@@ -144,10 +174,9 @@ def _hook(jid: str):
 def _worker(jid: str, url: str, opts: dict) -> None:
     with _SEM:
         cur = JOBS.get(jid)
-        if cur is None:
-            return
+        if cur is None: return
         try:
-            import yt_dlp  # lazy — modul besar
+            import yt_dlp
         except ImportError:
             cur.update(status="error", error="yt-dlp tidak terpasang di venv")
             return
@@ -162,23 +191,48 @@ def _worker(jid: str, url: str, opts: dict) -> None:
             "retries": 3, "nocheckcertificate": True,
         }
         try:
+            cur.update(status="extracting")
+            _log(jid, f"extract: {url}")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-            files = sorted((p for p in out.iterdir() if p.is_file()),
-                           key=lambda p: p.stat().st_mtime, reverse=True)
-            final = next((f for f in files if f.suffix.lower() in
-                          (".mp4", ".webm", ".mkv", ".m4a", ".mp3", ".opus")), None)
-            if not final:
+                info = ydl.extract_info(url, download=False)
+                if cur.get("cancel"):
+                    raise RuntimeError("dibatalkan user")
+                cur.update(
+                    title=info.get("title") or "video",
+                    thumbnail=info.get("thumbnail"),
+                    duration=info.get("duration"),
+                    uploader=info.get("uploader"),
+                    status="downloading",
+                )
+                _log(jid, f"download start: {info.get('title')}")
+                ydl.process_ie_result(info, download=True)
+            files = [p for p in out.iterdir()
+                     if p.is_file() and p.suffix.lower() in
+                     (".mp4", ".webm", ".mkv", ".m4a", ".mp3", ".opus")]
+            if not files:
                 raise RuntimeError("file hasil tidak ditemukan")
-            meta = {"title": info.get("title") or final.stem, "url": url,
-                    "duration": info.get("duration"), "thumbnail": info.get("thumbnail"),
-                    "uploader": info.get("uploader"),
-                    "file": final.name, "size": final.stat().st_size,
-                    "downloaded_at": time.time(), "status": "done"}
+            final = max(files, key=lambda p: p.stat().st_mtime)
+            meta = {
+                "title": cur.get("title") or final.stem,
+                "url": url,
+                "duration": cur.get("duration"),
+                "thumbnail": cur.get("thumbnail"),
+                "uploader": cur.get("uploader"),
+                "file": final.name,
+                "size": final.stat().st_size,
+                "downloaded_at": time.time(),
+                "status": "done",
+            }
             (out / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
             cur.update(meta)
+            _log(jid, f"done: {final.name} ({final.stat().st_size} bytes)")
         except Exception as e:
-            cur.update(status="error", error=str(e)[:500])
+            if cur.get("cancel"):
+                _log(jid, "cancelled")
+                cur.update(status="error", error="dibatalkan user")
+            else:
+                _log(jid, "ERROR:", traceback.format_exc())
+                cur.update(status="error", error=str(e)[:500])
 
 
 @bp.get("/download")
@@ -192,8 +246,10 @@ def start():
     if not re.match(r"^https?://", url):
         return jsonify(error="URL harus http(s)://"), 400
     jid = uuid.uuid4().hex[:10]
-    JOBS[jid] = {"status": "queued", "url": url,
-                 "created": time.time(), "percent": 0}
+    JOBS[jid] = {
+        "status": "queued", "url": url,
+        "created": time.time(), "percent": 0,
+    }
     threading.Thread(target=_worker, args=(jid, url, data), daemon=True).start()
     return jsonify(jid=jid)
 
@@ -203,6 +259,17 @@ def status(jid):
     if not JID.match(jid) or jid not in JOBS:
         return jsonify(error="tidak ditemukan"), 404
     return jsonify(JOBS[jid])
+
+
+@bp.get("/api/download/<jid>/debug")
+def debug_job(jid):
+    if not JID.match(jid):
+        return jsonify(error="jid invalid"), 400
+    return jsonify(
+        job=JOBS.get(jid),
+        on_disk=(LIBRARY / jid).exists(),
+        files=[p.name for p in (LIBRARY / jid).iterdir()] if (LIBRARY / jid).exists() else [],
+    )
 
 
 @bp.get("/api/downloads")
