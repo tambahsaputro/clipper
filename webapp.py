@@ -5,6 +5,7 @@ from pathlib import Path
 from flask import Flask, abort, jsonify, request, send_from_directory
 from werkzeug.utils import secure_filename
 import clipper, editor
+from downloader import bp as downloader_bp
 
 BASE = Path(__file__).parent.resolve()
 RUNS = Path(os.environ.get("CLIPPER_DATA", BASE / "runs")).expanduser()
@@ -19,6 +20,7 @@ JID = re.compile(r"^[0-9a-f]{10}$")
 CLIP = re.compile(r"^clip(\d+)\.mp4$")
 EDITED = re.compile(r"^edited\.mp4$")
 app = Flask(__name__)
+app.register_blueprint(downloader_bp)
 JOBS = {}
 
 
@@ -199,6 +201,7 @@ def edit():
         "auto_subtitle": request.form.get("auto_subtitle") == "on",
         "model": request.form.get("model", "base"),
         "lang": request.form.get("lang", "id"),
+        "ken_burns": request.form.get("ken_burns", "none"),
         "bgm": str(bgm_path) if bgm_path else None,
         "bgm_volume": bgm_vol,
         "watermark": str(wm_path) if wm_path else None,
@@ -266,6 +269,8 @@ def preview():
         Path(src).unlink(missing_ok=True)
         if params.get("watermark"):
             Path(params["watermark"]).unlink(missing_ok=True)
+        for _t in PREVIEWS.glob("prev_txt_*.txt"):
+            _t.unlink(missing_ok=True)
         for _t in PREVIEWS.glob("prev_txt_*.txt"):
             _t.unlink(missing_ok=True)
 
@@ -415,7 +420,8 @@ button:disabled{opacity:.5;cursor:wait}
 .clip h3{margin:8px 0 2px;font-size:15px}.clip p{margin:0 0 6px;color:var(--mu);font-size:13px}
 .clip a{color:var(--ac);font-size:14px;font-weight:600}
 .clip .pick{display:flex;gap:6px;align-items:center;font-size:14px}.clip .pick input{width:auto}
-</style></head><body><main>
+</style></head><body>
+<a href="/download" style="position:fixed;bottom:20px;right:20px;z-index:9999;display:inline-flex;align-items:center;gap:8px;padding:12px 18px;background:#4f9cf9;color:#fff;border-radius:50px;text-decoration:none;font-weight:600;box-shadow:0 6px 20px rgba(79,156,249,.45);font-family:system-ui,sans-serif">📥 Download</a><main>
 <h1>Clipper</h1>
 <div class="card"><div class="stor" id="stor"></div></div>
 <div class="tabs" id="tabs">
@@ -460,6 +466,12 @@ button:disabled{opacity:.5;cursor:wait}
 <option value="cool">Cool</option>
 <option value="vintage">Vintage</option>
 <option value="bw">Hitam-putih</option>
+</select></div>
+<div><label>Gerakan kamera (Ken Burns)</label><select name="ken_burns">
+<option value="none" selected>Statis</option>
+<option value="zoom-in">Zoom in (dekat)</option>
+<option value="zoom-out">Zoom out (jauh)</option>
+<option value="pan-right">Pan kanan</option>
 </select></div>
 </div>
 <label style="display:flex;gap:8px;align-items:center;color:var(--tx)"><input type="checkbox" name="sharpen" checked style="width:auto">Tajamkan video</label>
@@ -605,8 +617,8 @@ async function poll(id){
 
 /* ---- edit video ---- */
 const fE=$('#fEdit'),goE=$('#goEdit'),progE=$('#progEdit'),stepE=$('#stepEdit'),outE=$('#outEdit');
-const PRESETS={tiktok:{cg:'warm',sh:true,vg:false,as:true},cinematic:{cg:'cool',sh:true,vg:true,as:false},podcast:{cg:'none',sh:true,vg:false,as:true}};
-$('#presetSel').onchange=e=>{const p=PRESETS[e.target.value];if(!p)return;fE.color_grade.value=p.cg;fE.sharpen.checked=p.sh;fE.vignette.checked=p.vg;fE.auto_subtitle.checked=p.as;};
+const PRESETS={tiktok:{cg:'warm',sh:true,vg:false,as:true,kb:'zoom-in'},cinematic:{cg:'cool',sh:true,vg:true,as:false,kb:'zoom-in'},podcast:{cg:'none',sh:true,vg:false,as:true,kb:'none'}};
+$('#presetSel').onchange=e=>{const p=PRESETS[e.target.value];if(!p)return;fE.color_grade.value=p.cg;fE.sharpen.checked=p.sh;fE.vignette.checked=p.vg;fE.auto_subtitle.checked=p.as;if(p.kb)fE.ken_burns.value=p.kb;};
 function addOverlayRow(){
   const div=el('div');div.className='card';div.style.padding='10px';div.style.marginTop='8px';
   div.innerHTML=`
