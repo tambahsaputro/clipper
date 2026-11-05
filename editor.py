@@ -5,6 +5,25 @@ from pathlib import Path
 import clipper
 
 
+def _run_tolerant(cmd, cwd=None, expect_path=None):
+    """Run ffmpeg, tolerate SIGABRT at cleanup if output file is valid.
+
+    Build ffmpeg ini crash di src/fftools/ffmpeg_dec.c:597 saat -frames:v 1
+    (stop mid-stream), tapi file output sudah ditulis sebelum crash.
+    """
+    res = subprocess.run(cmd, cwd=cwd, capture_output=True)
+    if res.returncode == 0:
+        return
+    target = expect_path
+    if target is None and cmd:
+        target = (Path(cwd) / cmd[-1]) if cwd else Path(cmd[-1])
+    if res.returncode == -6 and target and target.exists() and target.stat().st_size > 0:
+        print(f"  [ffmpeg crash at cleanup tolerated - output OK: {target.name}]")
+        return
+    err = res.stderr.decode(errors="replace")[-800:]
+    raise RuntimeError(f"ffmpeg exit {res.returncode}: {err}")
+
+
 def font_path():
     for p in [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -98,7 +117,21 @@ def preview_frame(src, params, out_dir, time=1.0, name="preview.png"):
 
     out_file = out_dir / name
     wm = params.get("watermark")
+    # Step 1: extract frame (SIGABRT at cleanup tolerated via _run_tolerant)
+    tmp_frame = out_dir / f"_tmp_{name}"
+    _run_tolerant(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-ss", str(time), "-i", str(src),
+         "-an",
+         "-vf", ",".join(filters),
+         "-frames:v", "1", "-update", "1",
+         tmp_frame.name],
+        cwd=out_dir,
+        expect_path=tmp_frame,
+    )
+
     if wm:
+        # Step 2: composite watermark (image -> image, stable)
         wm_size = int(params.get("watermark_size", 200))
         wm_pos = params.get("watermark_position", "top-right")
         pos_map = {
@@ -108,25 +141,21 @@ def preview_frame(src, params, out_dir, time=1.0, name="preview.png"):
             "bottom-right": "W-w-20:H-h-20",
         }
         xy = pos_map.get(wm_pos, "W-w-20:20")
-        fc = (f"[0:v]{','.join(filters)}[vbase];"
-              f"[1:v]scale={wm_size}:-1[wm];"
-              f"[vbase][wm]overlay={xy}[vout]")
-        clipper.run(
+        _run_tolerant(
             ["ffmpeg", "-y", "-loglevel", "error",
-             "-ss", str(time), "-i", str(src),
+             "-i", tmp_frame.name,
              "-i", str(wm),
-             "-filter_complex", fc, "-map", "[vout]",
-             "-frames:v", "1", out_file.name],
+             "-filter_complex",
+             f"[1:v]scale={wm_size}:-1[wm];[0:v][wm]overlay={xy}:format=auto",
+             "-frames:v", "1", "-update", "1",
+             out_file.name],
             cwd=out_dir,
+            expect_path=out_file,
         )
+        tmp_frame.unlink(missing_ok=True)
     else:
-        clipper.run(
-            ["ffmpeg", "-y", "-loglevel", "error",
-             "-ss", str(time), "-i", str(src),
-             "-vf", ",".join(filters),
-             "-frames:v", "1", out_file.name],
-            cwd=out_dir,
-        )
+        tmp_frame.rename(out_file)
+
     return out_file
 
 

@@ -10,3 +10,6 @@ run.log
 *.bak
 settings.json
 library/
+dl.log
+test5min.mp4
+cookies-*.txt
